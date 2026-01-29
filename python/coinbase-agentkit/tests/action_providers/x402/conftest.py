@@ -19,7 +19,7 @@ MOCK_PAYMENT_REQUIREMENTS = {
     "mimeType": "application/json",
     "payTo": "0x9876543210987654321098765432109876543210",
     "maxTimeoutSeconds": 300,
-    "asset": "0x5555666677778888999900001111222233334444",
+    "asset": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",  # Real USDC address on base-sepolia
 }
 
 MOCK_PAYMENT_PROOF = {
@@ -54,6 +54,7 @@ def mock_requests():
 
         payment_required_response = Mock(spec=requests.Response)
         payment_required_response.status_code = 402
+        payment_required_response.headers = {}
         payment_required_response.json.return_value = {"accepts": [MOCK_PAYMENT_REQUIREMENTS]}
 
         paid_response = Mock(spec=requests.Response)

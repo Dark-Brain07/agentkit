@@ -1,35 +1,66 @@
 import { z } from "zod";
-import { KNOWN_FACILITATORS, KnownFacilitatorName, DEFAULT_FACILITATOR } from "./constants";
+import { DEFAULT_FACILITATOR } from "./constants";
 
 /**
- * Resolves a facilitator name or URL to the actual URL.
- *
- * @param facilitator - Either a known facilitator name ('cdp', 'payai') or a custom URL
- * @returns The facilitator URL
+ * Schema for listing registered services/facilitators (no parameters required).
  */
-export function resolveFacilitatorUrl(facilitator: string): string {
-  if (facilitator in KNOWN_FACILITATORS) {
-    return KNOWN_FACILITATORS[facilitator as KnownFacilitatorName];
-  }
-  return facilitator;
+export const EmptySchema = z.object({}).strip().describe("No parameters required");
+
+/**
+ * Configuration options for X402ActionProvider.
+ 
+ */
+export interface X402Config {
+  /** Service URLs the agent can call. Only these services will be allowed for HTTP requests. */
+  registeredServices?: string[];
+
+  /**
+   * Allow agent to register services discovered from bazaar at runtime.
+   * Default: false (or X402_ALLOW_DYNAMIC_SERVICE_REGISTRATION="true" env var)
+   */
+  allowDynamicServiceRegistration?: boolean;
+
+  /**
+   * Additional facilitators beyond the defaults (CDP + PayAI).
+   * Map of name -> URL. Names can be used with discover_x402_services action.
+   * Example: { "myFacilitator": "https://my-facilitator.com" }
+   */
+  registeredFacilitators?: Record<string, string>;
+
+  /**
+   * Maximum payment per request in USDC whole units.
+   * Default: 1.0 (or X402_MAX_PAYMENT_USDC env var)
+   */
+  maxPaymentUsdc?: number;
 }
+
+/**
+ * Schema for registering a service URL for x402 requests.
+ * Only available when allowDynamicServiceRegistration is true.
+ */
+export const RegisterServiceSchema = z
+  .object({
+    url: z.string().url().describe("Service URL to register for x402 requests"),
+  })
+  .strip()
+  .describe("Parameters for registering a service URL for x402 requests");
 
 // Schema for listing x402 services
 export const ListX402ServicesSchema = z
   .object({
     facilitator: z
-      .union([z.enum(["cdp", "payai"]), z.string().url()])
+      .string()
       .default(DEFAULT_FACILITATOR)
       .describe(
-        "Facilitator to query: 'cdp' (Coinbase CDP), 'payai' (PayAI Network), or a custom facilitator URL.",
+        "Facilitator to query: 'cdp' (Coinbase CDP), 'payai' (PayAI) or a registered custom facilitator name.",
       ),
     maxUsdcPrice: z
       .number()
-      .positive()
+      .nonnegative()
       .finite()
-      .optional()
+      .default(1.0)
       .describe(
-        "Optional maximum price in USDC whole units (e.g., 0.1 for 0.10 USDC). Only USDC payment options will be considered when this filter is applied.",
+        "Maximum price in USDC whole units (e.g., 0.1 for 0.10 USDC). Only USDC payment options will be considered. Defaults to 1.0 USDC.",
       ),
     x402Versions: z
       .array(z.union([z.literal(1), z.literal(2)]))

@@ -8,6 +8,7 @@ from coinbase_agentkit import (
     AgentKitConfig,
     CdpEvmWalletProvider,
     CdpEvmWalletProviderConfig,
+    X402Config,
     cdp_api_action_provider,
     cdp_evm_wallet_action_provider,
     erc20_action_provider,
@@ -64,7 +65,18 @@ def initialize_agent(config: CdpEvmWalletProviderConfig):
                 pyth_action_provider(),
                 wallet_action_provider(),
                 weth_action_provider(),
-                x402_action_provider(),
+                x402_action_provider(
+                    X402Config(
+                        registered_services=["https://www.x402.org/protected"]
+                        if config.network_id == "base-sepolia"
+                        else [],  # add approved x402 services
+                        allow_dynamic_service_registration=False,  # set to true to allow registering services discovered through facilitators bazaar
+                        max_payment_usdc=1.0,  # maximum payment per request in USDC
+                        registered_facilitators={
+                            "my-custom-facilitator": "https://my-custom-facilitator.example.com",
+                        },  # add custom facilitators for discovery (CDP and PayAI are pre-registered), format: { "name": "https://url" }
+                    )
+                ),
             ],
         )
     )

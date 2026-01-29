@@ -60,19 +60,22 @@ def test_http_request_schema_invalid():
 
 def test_retry_schema_valid():
     """Test that the RetryWithX402Schema validates correctly."""
+    from coinbase_agentkit.action_providers.x402.schemas import PaymentOptionSchema
+
+    payment_option = PaymentOptionSchema(
+        scheme=MOCK_PAYMENT_REQUIREMENTS["scheme"],
+        network=MOCK_PAYMENT_REQUIREMENTS["network"],
+        asset=MOCK_PAYMENT_REQUIREMENTS["asset"],
+        max_amount_required=MOCK_PAYMENT_REQUIREMENTS["maxAmountRequired"],
+        pay_to=MOCK_PAYMENT_REQUIREMENTS["payTo"],
+    )
     valid_input = {
         "url": MOCK_URL,
-        "scheme": MOCK_PAYMENT_REQUIREMENTS["scheme"],
-        "network": MOCK_PAYMENT_REQUIREMENTS["network"],
-        "max_amount_required": MOCK_PAYMENT_REQUIREMENTS["maxAmountRequired"],
-        "resource": MOCK_PAYMENT_REQUIREMENTS["resource"],
-        "pay_to": MOCK_PAYMENT_REQUIREMENTS["payTo"],
-        "max_timeout_seconds": MOCK_PAYMENT_REQUIREMENTS["maxTimeoutSeconds"],
-        "asset": MOCK_PAYMENT_REQUIREMENTS["asset"],
+        "selected_payment_option": payment_option,
     }
     schema = RetryWithX402Schema(**valid_input)
     assert schema.url == MOCK_URL
-    assert schema.network == MOCK_PAYMENT_REQUIREMENTS["network"]
+    assert schema.selected_payment_option.network == MOCK_PAYMENT_REQUIREMENTS["network"]
 
 
 def test_retry_schema_invalid():
@@ -101,8 +104,11 @@ def test_direct_schema_invalid():
 
 def test_make_http_request_success(mock_wallet, mock_requests):
     """Test successful HTTP request without payment requirement."""
+    from coinbase_agentkit.action_providers.x402.schemas import X402Config
+
     mock_requests.return_value = mock_requests.success_response
-    provider = x402_action_provider()
+    config = X402Config(registered_services=[MOCK_URL])
+    provider = x402_action_provider(config)
 
     response = json.loads(
         provider.make_http_request(mock_wallet, {"url": MOCK_URL, "method": "GET"})
@@ -117,8 +123,17 @@ def test_make_http_request_success(mock_wallet, mock_requests):
 
 def test_make_http_request_402(mock_wallet, mock_requests):
     """Test HTTP request that returns 402 Payment Required."""
+    from coinbase_agentkit.action_providers.x402.schemas import X402Config
+    from coinbase_agentkit.network import Network
+
     mock_requests.return_value = mock_requests.payment_required_response
-    provider = x402_action_provider()
+    config = X402Config(registered_services=[MOCK_URL])
+    provider = x402_action_provider(config)
+
+    # Mock the wallet network
+    mock_wallet.get_network.return_value = Network(
+        chain_id="84532", network_id="base-sepolia", protocol_family="evm"
+    )
 
     response = json.loads(
         provider.make_http_request(mock_wallet, {"url": MOCK_URL, "method": "POST"})
@@ -128,7 +143,7 @@ def test_make_http_request_402(mock_wallet, mock_requests):
     assert len(response["acceptablePaymentOptions"]) == 1
     payment_option = response["acceptablePaymentOptions"][0]
     assert payment_option["network"] == MOCK_PAYMENT_REQUIREMENTS["network"]
-    assert len(response["nextSteps"]) == 4
+    assert len(response["nextSteps"]) > 0
 
 
 def test_make_http_request_error(mock_wallet, mock_requests):

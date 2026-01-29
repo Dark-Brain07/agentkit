@@ -6,6 +6,8 @@ import { EvmWalletProvider, SvmWalletProvider, WalletProvider } from "../../wall
 import {
   SOLANA_USDC_ADDRESSES,
   NETWORK_MAPPINGS,
+  KNOWN_FACILITATORS,
+  KnownFacilitatorName,
   type DiscoveryResource,
   type SimplifiedResource,
   type X402Version,
@@ -42,38 +44,47 @@ export function getNetworkId(network: string): string {
 }
 
 /**
- * Fetches a URL with retry logic and exponential backoff for rate limiting.
+ * Fetches a URL with retry logic and exponential backoff for errors.
  *
  * @param url - The URL to fetch
+ * @param context - Optional context string for error messages (e.g., "page 1")
  * @param maxRetries - Maximum number of retries (default 3)
  * @param initialDelayMs - Initial delay in milliseconds (default 1000)
  * @returns The fetch Response
  */
 async function fetchWithRetry(
   url: string,
+  context: string = "",
   maxRetries: number = 3,
   initialDelayMs: number = 1000,
 ): Promise<Response> {
-  let lastError: Error | null = null;
+  const contextStr = context ? ` (${context})` : "";
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const response = await fetch(url);
+    try {
+      const response = await fetch(url);
 
-    if (response.ok) {
-      return response;
-    }
+      if (response.ok) {
+        return response;
+      }
 
-    if (response.status === 429 && attempt < maxRetries) {
+      throw new Error(`HTTP ${response.status} ${response.statusText}`);
+    } catch (error) {
+      if (attempt >= maxRetries) {
+        throw new Error(
+          `Failed to fetch${contextStr} after ${maxRetries} retries: ${error instanceof Error ? error.message : error}`,
+        );
+      }
+
       const delayMs = initialDelayMs * Math.pow(2, attempt);
+      console.log(
+        `Fetch error${contextStr}: ${error instanceof Error ? error.message : error}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${maxRetries})`,
+      );
       await new Promise(resolve => setTimeout(resolve, delayMs));
-      continue;
     }
-
-    lastError = new Error(`Discovery API error: ${response.status} ${response.statusText}`);
-    break;
   }
 
-  throw lastError ?? new Error("Failed to fetch after retries");
+  throw new Error(`Failed to fetch${contextStr} after ${maxRetries} retries`);
 }
 
 /**
@@ -89,29 +100,60 @@ export async function fetchAllDiscoveryResources(
 ): Promise<DiscoveryResource[]> {
   const allResources: DiscoveryResource[] = [];
   let offset = 0;
-  let hasMore = true;
+  let pageNumber = 1;
+  let knownTotal = 0;
 
-  while (hasMore) {
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
     const url = new URL(discoveryUrl);
     url.searchParams.set("limit", pageSize.toString());
     url.searchParams.set("offset", offset.toString());
 
-    const response = await fetchWithRetry(url.toString());
+    const pageContext = `page ${pageNumber}, offset ${offset}`;
+
+    let response: Response;
+    try {
+      response = await fetchWithRetry(url.toString(), pageContext);
+    } catch {
+      // If a page fails, skip to the next page
+      console.log(`Failed to fetch ${pageContext}, skipping to next page`);
+      offset += pageSize;
+      pageNumber++;
+
+      // Stop if we've exceeded the known total (from previous successful responses)
+      if (knownTotal > 0 && offset >= knownTotal) {
+        break;
+      }
+      // If we've never had a successful response, stop after first failure
+      if (knownTotal === 0) {
+        break;
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 250));
+      continue;
+    }
 
     const data = await response.json();
     const resources = data.resources ?? data.items ?? [];
+    const total = data.pagination?.total ?? 0;
 
-    if (resources.length === 0) {
-      hasMore = false;
-    } else {
-      allResources.push(...resources);
-      offset += resources.length;
-
-      // Stop when getting fewer resources than requested (last page)
-      if (resources.length < pageSize) {
-        hasMore = false;
-      }
+    // Update known total from successful response
+    if (total > 0) {
+      knownTotal = total;
     }
+
+    allResources.push(...resources);
+
+    // Use pagination.total to determine if we're done
+    offset += resources.length;
+    pageNumber++;
+
+    if (resources.length === 0 || offset >= knownTotal) {
+      break;
+    }
+
+    // Small delay between pages to avoid rate limiting
+    await new Promise(resolve => setTimeout(resolve, 250));
   }
 
   return allResources;
@@ -569,4 +611,114 @@ export function buildUrlWithParams(
     url.searchParams.append(key, value);
   });
   return url.toString();
+}
+
+/**
+ * Checks if a URL is registered for x402 requests.
+ * Matches by origin (protocol + hostname + port) or prefix.
+ *
+ * @param url - The URL to check
+ * @param registeredServices - Set of registered service URLs
+ * @returns True if the service is registered, false otherwise
+ */
+export function isServiceRegistered(url: string, registeredServices: Set<string>): boolean {
+  if (registeredServices.size === 0) {
+    return false;
+  }
+
+  try {
+    const parsed = new URL(url);
+    const origin = parsed.origin;
+
+    for (const registered of registeredServices) {
+      // Check if origin matches or URL starts with registered prefix
+      if (origin === registered || url.startsWith(registered)) {
+        return true;
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Filters payment options to only include USDC payments.
+ *
+ * @param accepts - Array of payment options
+ * @param walletProvider - Wallet provider for USDC address lookup
+ * @returns Array of USDC-only payment options
+ */
+export function filterUsdcPaymentOptions(
+  accepts: Array<{
+    scheme?: string;
+    network: string;
+    asset: string;
+    maxAmountRequired?: string;
+    amount?: string;
+    payTo?: string;
+  }>,
+  walletProvider: WalletProvider,
+): typeof accepts {
+  return accepts.filter(option => isUsdcAsset(option.asset, walletProvider));
+}
+
+/**
+ * Validates that a payment amount is within the configured limit.
+ *
+ * @param amountAtomic - The payment amount in atomic units (e.g., 6 decimals for USDC)
+ * @param maxPaymentUsdc - Maximum payment in USDC whole units
+ * @returns Object with isValid flag and formatted amounts for error messages
+ */
+export function validatePaymentLimit(
+  amountAtomic: string,
+  maxPaymentUsdc: number,
+): { isValid: boolean; requestedAmount: string; maxAmount: string } {
+  const USDC_DECIMALS = 6;
+  const maxAmountAtomic = parseUnits(maxPaymentUsdc.toString(), USDC_DECIMALS);
+  const requested = BigInt(amountAtomic);
+
+  return {
+    isValid: requested <= maxAmountAtomic,
+    requestedAmount: formatUnits(requested, USDC_DECIMALS),
+    maxAmount: maxPaymentUsdc.toString(),
+  };
+}
+
+/**
+ * Checks if a URL is allowed for x402 requests.
+ *
+ * @param url - The URL to check
+ * @param registeredServices - Set of registered service URLs
+ * @returns True if registered, false otherwise
+ */
+export function isUrlAllowed(url: string, registeredServices: Set<string>): boolean {
+  return isServiceRegistered(url, registeredServices);
+}
+
+/**
+ * Checks if a facilitator is allowed (known name or registered name).
+ *
+ * @param facilitator - The facilitator name to check
+ * @param registeredFacilitators - Map of registered custom facilitator names to URLs
+ * @returns Object with isAllowed flag and resolved URL
+ */
+export function validateFacilitator(
+  facilitator: string,
+  registeredFacilitators: Record<string, string>,
+): { isAllowed: boolean; resolvedUrl: string } {
+  // Check if it's a known facilitator name (CDP, PayAI)
+  if (facilitator in KNOWN_FACILITATORS) {
+    return {
+      isAllowed: true,
+      resolvedUrl: KNOWN_FACILITATORS[facilitator as KnownFacilitatorName],
+    };
+  }
+
+  // Check if it's a registered custom facilitator name
+  if (facilitator in registeredFacilitators) {
+    return { isAllowed: true, resolvedUrl: registeredFacilitators[facilitator] };
+  }
+
+  return { isAllowed: false, resolvedUrl: facilitator };
 }

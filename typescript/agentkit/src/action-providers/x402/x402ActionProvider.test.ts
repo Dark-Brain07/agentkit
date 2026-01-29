@@ -6,17 +6,12 @@ import { registerExactEvmScheme } from "@x402/evm/exact/client";
 import { registerExactSvmScheme } from "@x402/svm/exact/client";
 
 import * as utils from "./utils";
-import { resolveFacilitatorUrl } from "./schemas";
 
 // Mock external modules
 jest.mock("@x402/fetch");
 jest.mock("@x402/evm/exact/client");
 jest.mock("@x402/svm/exact/client");
 jest.mock("./utils");
-jest.mock("./schemas", () => ({
-  ...jest.requireActual("./schemas"),
-  resolveFacilitatorUrl: jest.fn(),
-}));
 
 // Create mock functions
 const mockFetch = jest.fn();
@@ -39,7 +34,11 @@ const mockFilterByKeyword = jest.fn();
 const mockFilterByMaxPrice = jest.fn();
 const mockFormatSimplifiedResources = jest.fn();
 const mockBuildUrlWithParams = jest.fn();
-const mockResolveFacilitatorUrl = jest.fn();
+const mockIsUsdcAsset = jest.fn();
+const mockValidatePaymentLimit = jest.fn();
+const mockFilterUsdcPaymentOptions = jest.fn();
+const mockIsUrlAllowed = jest.fn();
+const mockValidateFacilitator = jest.fn();
 
 // Setup mocks
 jest
@@ -64,7 +63,11 @@ jest.mocked(utils.filterByKeyword).mockImplementation(mockFilterByKeyword);
 jest.mocked(utils.filterByMaxPrice).mockImplementation(mockFilterByMaxPrice);
 jest.mocked(utils.formatSimplifiedResources).mockImplementation(mockFormatSimplifiedResources);
 jest.mocked(utils.buildUrlWithParams).mockImplementation(mockBuildUrlWithParams);
-jest.mocked(resolveFacilitatorUrl).mockImplementation(mockResolveFacilitatorUrl);
+jest.mocked(utils.isUsdcAsset).mockImplementation(mockIsUsdcAsset);
+jest.mocked(utils.validatePaymentLimit).mockImplementation(mockValidatePaymentLimit);
+jest.mocked(utils.filterUsdcPaymentOptions).mockImplementation(mockFilterUsdcPaymentOptions);
+jest.mocked(utils.isUrlAllowed).mockImplementation(mockIsUrlAllowed);
+jest.mocked(utils.validateFacilitator).mockImplementation(mockValidateFacilitator);
 
 // Mock global fetch
 global.fetch = mockFetch;
@@ -130,7 +133,13 @@ describe("X402ActionProvider", () => {
   let provider: X402ActionProvider;
 
   beforeEach(() => {
-    provider = new X402ActionProvider();
+    provider = new X402ActionProvider({
+      registeredServices: [
+        "https://api.example.com",
+        "https://www.x402.org",
+        "https://example.com",
+      ],
+    });
     jest.clearAllMocks();
 
     // Setup default mock behaviors
@@ -144,7 +153,14 @@ describe("X402ActionProvider", () => {
       });
     });
     mockFormatPaymentOption.mockResolvedValue("mocked payment option");
-    mockResolveFacilitatorUrl.mockReturnValue("https://api.cdp.coinbase.com/platform/v2/x402");
+    mockIsUsdcAsset.mockReturnValue(true);
+    mockValidatePaymentLimit.mockReturnValue({ isValid: true, requestedAmount: 0, maxAmount: 1.0 });
+    mockFilterUsdcPaymentOptions.mockImplementation(options => options);
+    mockIsUrlAllowed.mockReturnValue(true);
+    mockValidateFacilitator.mockReturnValue({
+      isAllowed: true,
+      resolvedUrl: "https://facilitator.com",
+    });
   });
 
   afterEach(() => {
@@ -179,6 +195,21 @@ describe("X402ActionProvider", () => {
   });
 
   describe("makeHttpRequest", () => {
+    it("should reject unregistered service URLs", async () => {
+      mockIsUrlAllowed.mockReturnValue(false);
+
+      const result = await provider.makeHttpRequest(makeMockWalletProvider("base-sepolia"), {
+        url: "https://unregistered-service.com/api",
+        method: "GET",
+      });
+
+      const parsedResult = JSON.parse(result);
+      expect(parsedResult.error).toBe(true);
+      expect(parsedResult.message).toBe("Service not registered");
+      expect(parsedResult.details).toContain("https://unregistered-service.com/api");
+      expect(parsedResult.registeredServices).toBeDefined();
+    });
+
     it("should handle successful non-payment requests", async () => {
       mockFetch.mockResolvedValue(
         createMockResponse({
@@ -238,6 +269,21 @@ describe("X402ActionProvider", () => {
   });
 
   describe("discoverX402Services", () => {
+    it("should reject unregistered facilitators", async () => {
+      mockValidateFacilitator.mockReturnValue({ isAllowed: false, resolvedUrl: "" });
+
+      const result = await provider.discoverX402Services(makeMockWalletProvider("base-sepolia"), {
+        facilitator: "unknown-facilitator",
+        maxUsdcPrice: 1.0,
+        x402Versions: [1, 2],
+      });
+
+      const parsed = JSON.parse(result);
+      expect(parsed.error).toBe(true);
+      expect(parsed.message).toBe("Facilitator not allowed");
+      expect(parsed.details).toContain("unknown-facilitator");
+    });
+
     it("should list services without filters", async () => {
       const mockResources = [
         {
@@ -272,6 +318,7 @@ describe("X402ActionProvider", () => {
 
       const result = await provider.discoverX402Services(makeMockWalletProvider("base-sepolia"), {
         facilitator: "cdp",
+        maxUsdcPrice: 1.0,
         x402Versions: [1, 2],
       });
       const parsed = JSON.parse(result);
@@ -345,6 +392,7 @@ describe("X402ActionProvider", () => {
 
       const result = await provider.discoverX402Services(makeMockWalletProvider("base-sepolia"), {
         facilitator: "cdp",
+        maxUsdcPrice: 1.0,
         x402Versions: [1, 2],
       });
       const parsed = JSON.parse(result);
@@ -354,6 +402,52 @@ describe("X402ActionProvider", () => {
   });
 
   describe("retryWithX402", () => {
+    it("should reject unregistered service URLs", async () => {
+      mockIsUrlAllowed.mockReturnValue(false);
+
+      const result = await provider.retryWithX402(makeMockWalletProvider("base-sepolia"), {
+        url: "https://unregistered-service.com/protected",
+        method: "GET",
+        selectedPaymentOption: {
+          scheme: "exact",
+          network: "base-sepolia",
+          maxAmountRequired: "10000",
+          asset: "0x456",
+        },
+      });
+
+      const parsedResult = JSON.parse(result);
+      expect(parsedResult.error).toBe(true);
+      expect(parsedResult.message).toBe("Service not registered");
+      expect(parsedResult.details).toContain("https://unregistered-service.com/protected");
+    });
+
+    it("should reject payments exceeding max spending limit", async () => {
+      mockValidatePaymentLimit.mockReturnValue({
+        isValid: false,
+        requestedAmount: 5.0,
+        maxAmount: 1.0,
+      });
+
+      const result = await provider.retryWithX402(makeMockWalletProvider("base-sepolia"), {
+        url: "https://www.x402.org/protected",
+        method: "GET",
+        selectedPaymentOption: {
+          scheme: "exact",
+          network: "base-sepolia",
+          maxAmountRequired: "5000000",
+          asset: "0x456",
+        },
+      });
+
+      const parsedResult = JSON.parse(result);
+      expect(parsedResult.error).toBe(true);
+      expect(parsedResult.message).toBe("Payment exceeds limit");
+      expect(parsedResult.details).toContain("5");
+      expect(parsedResult.details).toContain("1");
+      expect(parsedResult.maxPaymentUsdc).toBeDefined();
+    });
+
     it("should successfully retry with payment", async () => {
       mockGetX402Networks.mockReturnValue(["base-sepolia"]);
 
@@ -411,6 +505,24 @@ describe("X402ActionProvider", () => {
   });
 
   describe("makeHttpRequestWithX402", () => {
+    it("should reject unregistered service URLs", async () => {
+      mockIsUrlAllowed.mockReturnValue(false);
+
+      const result = await provider.makeHttpRequestWithX402(
+        makeMockWalletProvider("base-sepolia"),
+        {
+          url: "https://unregistered-service.com/protected",
+          method: "GET",
+        },
+      );
+
+      const parsedResult = JSON.parse(result);
+      expect(parsedResult.error).toBe(true);
+      expect(parsedResult.message).toBe("Service not registered");
+      expect(parsedResult.details).toContain("https://unregistered-service.com/protected");
+      expect(parsedResult.registeredServices).toBeDefined();
+    });
+
     it("should handle successful direct payment requests", async () => {
       // Encode the payment proof as base64
       const encodedPaymentProof = btoa(JSON.stringify(MOCK_PAYMENT_PROOF));

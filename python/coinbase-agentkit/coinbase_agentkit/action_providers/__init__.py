@@ -36,6 +36,7 @@ from .twitter.twitter_action_provider import TwitterActionProvider, twitter_acti
 from .wallet.wallet_action_provider import WalletActionProvider, wallet_action_provider
 from .weth.weth_action_provider import WethActionProvider, weth_action_provider
 from .wow.wow_action_provider import WowActionProvider, wow_action_provider
+from .x402.schemas import X402Config
 from .x402.x402_action_provider import x402_action_provider, x402ActionProvider
 
 __all__ = [
@@ -82,4 +83,5 @@ __all__ = [
     "wow_action_provider",
     "x402ActionProvider",
     "x402_action_provider",
+    "X402Config",
 ]

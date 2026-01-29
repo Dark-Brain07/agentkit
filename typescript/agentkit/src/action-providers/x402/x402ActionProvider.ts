@@ -7,7 +7,9 @@ import {
   RetryWithX402Schema,
   DirectX402RequestSchema,
   ListX402ServicesSchema,
-  resolveFacilitatorUrl,
+  RegisterServiceSchema,
+  EmptySchema,
+  X402Config,
 } from "./schemas";
 import { EvmWalletProvider, WalletProvider, SvmWalletProvider } from "../../wallet-providers";
 import { x402Client, wrapFetchWithPayment } from "@x402/fetch";
@@ -25,19 +27,47 @@ import {
   filterByMaxPrice,
   formatSimplifiedResources,
   buildUrlWithParams,
+  filterUsdcPaymentOptions,
+  validatePaymentLimit,
+  isUsdcAsset,
+  isUrlAllowed,
+  validateFacilitator,
 } from "./utils";
-import { SUPPORTED_NETWORKS } from "./constants";
+import { SUPPORTED_NETWORKS, KNOWN_FACILITATORS } from "./constants";
+
+/** Internal config type with all fields required */
+interface ResolvedX402Config {
+  registeredServices: string[];
+  allowDynamicServiceRegistration: boolean;
+  registeredFacilitators: Record<string, string>;
+  maxPaymentUsdc: number;
+}
 
 /**
  * X402ActionProvider provides actions for making HTTP requests, with optional x402 payment handling.
  */
 export class X402ActionProvider extends ActionProvider<WalletProvider> {
+  private readonly config: ResolvedX402Config;
+  private registeredServices: Set<string>;
+
   /**
    * Creates a new instance of X402ActionProvider.
    * Initializes the provider with x402 capabilities.
+   *
+   * @param config - Optional configuration for service registration and payment limits
    */
-  constructor() {
+  constructor(config: X402Config = {}) {
     super("x402", []);
+    this.config = {
+      registeredServices: config.registeredServices ?? [],
+      allowDynamicServiceRegistration:
+        config.allowDynamicServiceRegistration ??
+        process.env.X402_ALLOW_DYNAMIC_SERVICE_REGISTRATION === "true",
+      registeredFacilitators: config.registeredFacilitators ?? {},
+      maxPaymentUsdc:
+        config.maxPaymentUsdc ?? parseFloat(process.env.X402_MAX_PAYMENT_USDC ?? "1.0"),
+    };
+    this.registeredServices = new Set(this.config.registeredServices);
   }
 
   /**
@@ -59,8 +89,28 @@ export class X402ActionProvider extends ActionProvider<WalletProvider> {
   ): Promise<string> {
     try {
       console.log("args", args);
-      const facilitatorUrl = resolveFacilitatorUrl(args.facilitator);
-      const discoveryUrl = facilitatorUrl + "/discovery/resources";
+
+      // Validate facilitator is allowed (known name or registered name)
+      const { isAllowed, resolvedUrl } = validateFacilitator(
+        args.facilitator,
+        this.config.registeredFacilitators,
+      );
+      if (!isAllowed) {
+        const knownNames = Object.keys(KNOWN_FACILITATORS);
+        const customNames = Object.keys(this.config.registeredFacilitators);
+        const allNames = [...knownNames, ...customNames];
+        return JSON.stringify(
+          {
+            error: true,
+            message: "Facilitator not allowed",
+            details: `The facilitator "${args.facilitator}" is not recognized. Use one of: ${allNames.join(", ")}`,
+          },
+          null,
+          2,
+        );
+      }
+
+      const discoveryUrl = resolvedUrl + "/discovery/resources";
 
       // Fetch all resources with pagination
       const allResources = await fetchAllDiscoveryResources(discoveryUrl);
@@ -85,15 +135,13 @@ export class X402ActionProvider extends ActionProvider<WalletProvider> {
         filteredResources = filterByKeyword(filteredResources, args.keyword);
       }
 
-      // Apply price filter if maxUsdcPrice is provided
-      if (args.maxUsdcPrice !== undefined) {
-        filteredResources = await filterByMaxPrice(
-          filteredResources,
-          args.maxUsdcPrice,
-          walletProvider,
-          walletNetworks,
-        );
-      }
+      // Apply price filter
+      filteredResources = await filterByMaxPrice(
+        filteredResources,
+        args.maxUsdcPrice,
+        walletProvider,
+        walletNetworks,
+      );
 
       // Format simplified output
       const simplifiedResources = await formatSimplifiedResources(
@@ -153,6 +201,23 @@ If you receive a 402 Payment Required response, use retry_http_request_with_x402
     args: z.infer<typeof HttpRequestSchema>,
   ): Promise<string> {
     try {
+      // Check if service is registered
+      if (!isUrlAllowed(args.url, this.registeredServices)) {
+        return JSON.stringify(
+          {
+            error: true,
+            message: "Service not registered",
+            details: `The service URL "${args.url}" is not registered. Only approved services can be called.`,
+            registeredServices: Array.from(this.registeredServices),
+            suggestion: this.config.allowDynamicServiceRegistration
+              ? "Use register_x402_service to register this service first."
+              : "Dynamic service registration is disabled. Only pre-registered services can be used. Set allowDynamicServiceRegistration to true in the agent configuration to enable dynamic service registration.",
+          },
+          null,
+          2,
+        );
+      }
+
       const finalUrl = buildUrlWithParams(args.url, args.queryParams);
       let method = args.method ?? "GET";
       let canHaveBody = ["POST", "PUT", "PATCH"].includes(method);
@@ -221,15 +286,32 @@ If you receive a 402 Payment Required response, use retry_http_request_with_x402
         acceptsArray = (paymentData.accepts as typeof acceptsArray) ?? [];
       }
 
-      const availableNetworks = acceptsArray.map(option => option.network);
+      // Filter to USDC-only payment options
+      const usdcOptions = filterUsdcPaymentOptions(acceptsArray, walletProvider);
+      const availableNetworks = usdcOptions.map(option => option.network);
       const hasMatchingNetwork = availableNetworks.some((net: string) =>
         walletNetworks.includes(net),
       );
 
-      let paymentOptionsText = `The wallet networks ${walletNetworks.join(", ")} do not match any available payment options (${availableNetworks.join(", ")}).`;
+      // Check if no USDC options available
+      if (usdcOptions.length === 0) {
+        return JSON.stringify(
+          {
+            error: true,
+            message: "No USDC payment option available",
+            details:
+              "This service does not accept USDC payments. Only USDC payments are supported.",
+            originalOptions: acceptsArray,
+          },
+          null,
+          2,
+        );
+      }
+
+      let paymentOptionsText = `The wallet networks ${walletNetworks.join(", ")} do not match any available USDC payment options (${availableNetworks.join(", ")}).`;
 
       if (hasMatchingNetwork) {
-        const matchingOptions = acceptsArray.filter(option =>
+        const matchingOptions = usdcOptions.filter(option =>
           walletNetworks.includes(option.network),
         );
         const formattedOptions = await Promise.all(
@@ -244,7 +326,7 @@ If you receive a 402 Payment Required response, use retry_http_request_with_x402
             ),
           ),
         );
-        paymentOptionsText = `The payment options are: ${formattedOptions.join(", ")}`;
+        paymentOptionsText = `The USDC payment options are: ${formattedOptions.join(", ")}`;
       }
 
       // Extract discovery info from v2 response (description, mimeType, extensions)
@@ -255,7 +337,7 @@ If you receive a 402 Payment Required response, use retry_http_request_with_x402
 
       return JSON.stringify({
         status: "error_402_payment_required",
-        acceptablePaymentOptions: acceptsArray,
+        acceptablePaymentOptions: usdcOptions,
         ...(Object.keys(discoveryInfo).length > 0 && { discoveryInfo }),
         nextSteps: [
           "Inform the user that the requested server replied with a 402 Payment Required response.",
@@ -301,6 +383,53 @@ DO NOT use this action directly without first trying make_http_request!`,
   ): Promise<string> {
     try {
       console.log("args", args);
+
+      // Check if service is registered
+      if (!isUrlAllowed(args.url, this.registeredServices)) {
+        return JSON.stringify(
+          {
+            error: true,
+            message: "Service not registered",
+            details: `The service URL "${args.url}" is not registered. Only pre-registered services can be called.`,
+            registeredServices: Array.from(this.registeredServices),
+          },
+          null,
+          2,
+        );
+      }
+
+      // Check that payment option is USDC
+      if (!isUsdcAsset(args.selectedPaymentOption.asset, walletProvider)) {
+        return JSON.stringify(
+          {
+            error: true,
+            message: "Only USDC payments are supported",
+            details: `The selected payment asset "${args.selectedPaymentOption.asset}" is not USDC.`,
+          },
+          null,
+          2,
+        );
+      }
+
+      // Validate payment amount against limit
+      const paymentAmount =
+        args.selectedPaymentOption.maxAmountRequired ??
+        args.selectedPaymentOption.amount ??
+        args.selectedPaymentOption.price ??
+        "0";
+      const paymentValidation = validatePaymentLimit(paymentAmount, this.config.maxPaymentUsdc);
+      if (!paymentValidation.isValid) {
+        return JSON.stringify(
+          {
+            error: true,
+            message: "Payment exceeds limit",
+            details: `The requested payment of ${paymentValidation.requestedAmount} USDC exceeds the maximum spending limit of ${paymentValidation.maxAmount} USDC.`,
+            maxPaymentUsdc: this.config.maxPaymentUsdc,
+          },
+          null,
+          2,
+        );
+      }
 
       // Check network compatibility before attempting payment
       const walletNetworks = getX402Networks(walletProvider.getNetwork());
@@ -449,6 +578,23 @@ Unless specifically instructed otherwise, prefer the two-step approach with make
     args: z.infer<typeof DirectX402RequestSchema>,
   ): Promise<string> {
     try {
+      // Check if service is registered
+      if (!isUrlAllowed(args.url, this.registeredServices)) {
+        return JSON.stringify(
+          {
+            error: true,
+            message: "Service not registered",
+            details: `The service URL "${args.url}" is not registered. Only pre-registered services can be called.`,
+            registeredServices: Array.from(this.registeredServices),
+            suggestion: this.config.allowDynamicServiceRegistration
+              ? "Use register_x402_service to register this service first."
+              : "Dynamic service registration is disabled. Only pre-registered services can be used. Set allowDynamicServiceRegistration to true in the agent configuration to enable dynamic service registration.",
+          },
+          null,
+          2,
+        );
+      }
+
       if (
         !(
           walletProvider instanceof SvmWalletProvider || walletProvider instanceof EvmWalletProvider
@@ -538,6 +684,153 @@ Unless specifically instructed otherwise, prefer the two-step approach with make
   }
 
   /**
+   * Registers a service URL for x402 requests.
+   * Only available when allowDynamicServiceRegistration is true in the config.
+   *
+   * @param _walletProvider - The wallet provider (unused but required by interface)
+   * @param args - The service URL to register
+   * @returns A JSON string confirming registration or error if not allowed
+   */
+  @CreateAction({
+    name: "register_x402_service",
+    description: `
+Registers a service URL for x402 requests. Use this after discovering a service
+via discover_x402_services to enable HTTP requests to that service.
+
+NOTE: This action is only available if service discovery is enabled in the agent configuration.
+If disabled, services must be pre-registered by the agent administrator.`,
+    schema: RegisterServiceSchema,
+  })
+  async registerService(
+    _walletProvider: WalletProvider,
+    args: z.infer<typeof RegisterServiceSchema>,
+  ): Promise<string> {
+    // Check if service discovery is allowed
+    if (!this.config.allowDynamicServiceRegistration) {
+      return JSON.stringify(
+        {
+          error: true,
+          message: "Dynamic service registration is disabled",
+          details:
+            "The agent is configured with allowDynamicServiceRegistration: false. Services must be pre-registered.",
+        },
+        null,
+        2,
+      );
+    }
+
+    try {
+      // Validate URL format
+      new URL(args.url);
+
+      // Add to registered services (full URL for prefix matching)
+      this.registeredServices.add(args.url);
+
+      return JSON.stringify(
+        {
+          success: true,
+          message: `Service registered successfully`,
+          registeredUrl: args.url,
+          totalRegisteredServices: this.registeredServices.size,
+        },
+        null,
+        2,
+      );
+    } catch {
+      return JSON.stringify(
+        {
+          error: true,
+          message: "Invalid URL format",
+          details: `"${args.url}" is not a valid URL.`,
+        },
+        null,
+        2,
+      );
+    }
+  }
+
+  /**
+   * Lists all registered service URLs that can be used for x402 requests.
+   *
+   * @param _walletProvider - The wallet provider (unused but required by interface)
+   * @param _args - Empty arguments object (unused but required by interface)
+   * @returns A JSON string containing the list of registered services
+   */
+  @CreateAction({
+    name: "list_registered_services",
+    description: `
+Lists all service URLs that are currently approved for x402 requests.
+These are the only services that can be called using make_http_request or make_http_request_with_x402.`,
+    schema: EmptySchema,
+  })
+  async listRegisteredServices(
+    _walletProvider: WalletProvider,
+    _args: z.infer<typeof EmptySchema>,
+  ): Promise<string> {
+    const services = Array.from(this.registeredServices);
+
+    return JSON.stringify(
+      {
+        success: true,
+        registeredServices: services,
+        count: services.length,
+        allowDynamicServiceRegistration: this.config.allowDynamicServiceRegistration,
+        note: this.config.allowDynamicServiceRegistration
+          ? "You can register new services using register_x402_service."
+          : "Dynamic service registration is disabled. Only pre-registered services can be used.",
+      },
+      null,
+      2,
+    );
+  }
+
+  /**
+   * Lists all facilitators (known and custom registered) that can be used for service discovery.
+   *
+   * @param _walletProvider - The wallet provider (unused but required by interface)
+   * @param _args - Empty arguments object (unused but required by interface)
+   * @returns A JSON string containing the list of facilitators
+   */
+  @CreateAction({
+    name: "list_registered_facilitators",
+    description: "Lists all facilitators that can be used with discover_x402_services.",
+    schema: EmptySchema,
+  })
+  async listRegisteredFacilitators(
+    _walletProvider: WalletProvider,
+    _args: z.infer<typeof EmptySchema>,
+  ): Promise<string> {
+    const knownFacilitators = Object.entries(KNOWN_FACILITATORS).map(([name, url]) => ({
+      name,
+      url,
+      type: "known" as const,
+    }));
+
+    const customFacilitators = Object.entries(this.config.registeredFacilitators).map(
+      ([name, url]) => ({
+        name,
+        url,
+        type: "custom" as const,
+      }),
+    );
+
+    const allFacilitators = [...knownFacilitators, ...customFacilitators];
+
+    return JSON.stringify(
+      {
+        success: true,
+        facilitators: allFacilitators,
+        knownCount: knownFacilitators.length,
+        customCount: customFacilitators.length,
+        totalCount: allFacilitators.length,
+        note: "Use the 'facilitator' parameter in discover_x402_services to query a specific facilitator by name.",
+      },
+      null,
+      2,
+    );
+  }
+
+  /**
    * Checks if the action provider supports the given network.
    *
    * @param network - The network to check support for
@@ -583,4 +876,4 @@ Unless specifically instructed otherwise, prefer the two-step approach with make
   }
 }
 
-export const x402ActionProvider = () => new X402ActionProvider();
+export const x402ActionProvider = (config?: X402Config) => new X402ActionProvider(config);

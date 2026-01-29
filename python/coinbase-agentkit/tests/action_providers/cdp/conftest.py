@@ -9,6 +9,14 @@ from coinbase_agentkit.wallet_providers.cdp_evm_wallet_provider import (
     CdpEvmWalletProviderConfig,
 )
 
+
+@pytest.fixture(autouse=True)
+def mock_asyncio_sleep():
+    """Mock asyncio.sleep to eliminate delays in tests."""
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        yield
+
+
 MOCK_API_KEY_NAME = "mock-api-key"
 MOCK_API_KEY_PRIVATE_KEY = "mock-private-key"
 

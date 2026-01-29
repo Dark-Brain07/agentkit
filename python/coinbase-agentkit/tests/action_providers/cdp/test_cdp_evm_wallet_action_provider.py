@@ -256,12 +256,10 @@ class TestCdpEvmWalletActionProvider:
         assert "Error fetching swap price: API Error" in parsed_result["error"]
 
     @patch("coinbase_agentkit.action_providers.cdp.swap_utils.get_token_details")
-    @patch("coinbase_agentkit.action_providers.cdp.swap_utils.retry_with_exponential_backoff")
     @patch("asyncio.get_event_loop")
     def test_swap_successful_execution(
         self,
         mock_get_event_loop,
-        mock_retry,
         mock_get_token_details,
         action_provider,
         mock_evm_wallet_provider,
@@ -290,7 +288,6 @@ class TestCdpEvmWalletActionProvider:
         mock_swap_result = Mock()
         mock_swap_result.transaction_hash = MOCK_SWAP_TX_HASH
         mock_swap_quote.execute.return_value = mock_swap_result
-        mock_retry.return_value = mock_swap_result
 
         # Mock the event loop - need to return the result of the async function
         mock_loop = Mock()
@@ -434,14 +431,12 @@ class TestCdpEvmWalletActionProvider:
         assert "but only have 0.05 ETH" in parsed_result["error"]
 
     @patch("coinbase_agentkit.action_providers.cdp.swap_utils.get_token_details")
-    @patch("coinbase_agentkit.action_providers.cdp.swap_utils.retry_with_exponential_backoff")
     @patch("web3.Web3")
     @patch("asyncio.get_event_loop")
     def test_swap_with_approval_transaction(
         self,
         mock_get_event_loop,
         mock_web3,
-        mock_retry,
         mock_get_token_details,
         action_provider,
         mock_evm_wallet_provider,
@@ -490,7 +485,6 @@ class TestCdpEvmWalletActionProvider:
         mock_swap_result = Mock()
         mock_swap_result.transaction_hash = MOCK_SWAP_TX_HASH
         mock_swap_quote.execute.return_value = mock_swap_result
-        mock_retry.return_value = mock_swap_result
 
         # Mock the event loop
         mock_loop = Mock()
